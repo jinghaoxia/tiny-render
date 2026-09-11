@@ -76,7 +76,7 @@ fn barycentric(p: glam::Vec2, a: glam::Vec2, b: glam::Vec2, c: glam::Vec2) -> gl
         (u - o).perp_dot(v - o)
     }
 
-    // TODO: 按上面的面积比公式,算出三个重心坐标。
+    //   按上面的面积比公式,算出三个重心坐标。
     //   denom = cross2(a, b, c)   —— 整个三角形的 2 倍面积
     //   λa    = cross2(p, b, c) / denom
     //   λb    = cross2(p, c, a) / denom
@@ -90,17 +90,23 @@ fn barycentric(p: glam::Vec2, a: glam::Vec2, b: glam::Vec2, c: glam::Vec2) -> gl
     glam::Vec3::new(λa, λb, λc)
 }
 
-/// 光栅化一个三角形:把落在它内部的像素涂成 color。
-/// 参数是三个屏幕坐标(project 的输出),允许有负值/越界,内部会挡。
+/// 光栅化一个三角形:把落在它内部的像素涂成 color,但只有比深度缓冲更近才画。
+/// 参数是三个屏幕坐标(project 的输出),以及三个顶点的深度 za/zb/zc。
+///
+/// 深度约定:M3 里直接用模型坐标的 z 当深度,越大越接近相机。
+/// 屏幕上一个像素的深度 = 三个顶点深度按重心坐标加权平均(与颜色无关,顶点属性通用插值)。
 fn rasterize_triangle(
     img: &mut RgbImage,
+    zbuf: &mut [f32],
     ax: i32, ay: i32, bx: i32, by: i32, cx: i32, cy: i32,
+    za: f32, zb: f32, zc: f32,
     color: Rgb<u8>,
 ) {
     // 三个顶点转成 2D 浮点坐标,供重心坐标用
     let a = glam::Vec2::new(ax as f32, ay as f32);
     let b = glam::Vec2::new(bx as f32, by as f32);
     let c = glam::Vec2::new(cx as f32, cy as f32);
+    let w = img.width() as usize;
 
     // 包围盒:三角形在 x/y 上跨过的最小矩形
     let min_x = ax.min(bx).min(cx);
@@ -121,7 +127,19 @@ fn rasterize_triangle(
             let bc = barycentric(p, a, b, c);
             // 三个重心坐标都 >= 0 ⟺ 在三角形内(含边界)
             if bc.min_element() >= 0.0 {
-                img.put_pixel(x as u32, y as u32, color);
+                // TODO: 用重心坐标把三个顶点的深度插值到这一个像素。
+                //   z_pixel = λa·za + λb·zb + λc·zc
+                // bc 就是 (λa, λb, λc),用 bc.x / bc.y / bc.z。
+                let z = bc.x * za + bc.y*zb+bc.z*zc;
+
+                let idx = y as usize * w + x as usize;
+                // TODO: 深度测试 —— 这个三角形在此像素比已经记录的更近吗?
+                //   约定 z 越大越近,所以:z > zbuf[idx] 才画这个像素,
+                //   画完别忘了把 zbuf[idx] 更新成这个 z(它现在是最新的"最近者")。
+                if z>zbuf[idx] {
+                    img.put_pixel(x as u32, y as u32, color);
+                    zbuf[idx] = z;
+                }
             }
         }
     }
@@ -131,6 +149,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let width = 800u32;
     let height = 800u32;
     let mut img = RgbImage::new(width, height);
+
+    // 深度缓冲:每个像素存"这个像素目前看到的最深"。
+    // 初始为负无穷,z 越大越近,所以任何真实的 z(-0.5..0.5)都会大于它。
+    let mut zbuf = vec![f32::NEG_INFINITY; (width * height) as usize];
 
     let model = load_obj("resource/klee.obj")?;
     eprintln!(
@@ -142,10 +164,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // 遍历每个三角形并光栅化填充。
-    // 暂时给每个三角形不同的颜色:能一眼看出"哪个三角形光栅化错了"。
-    // 全部正确后,把颜色统一成白色即可。
-    for (i, face) in model.faces.iter().enumerate() {
-        // 三个顶点坐标(模型空间)
+    // M3:统一白色 + 深度缓冲,由 z 决定谁画在最前,不再乱序覆盖。
+    let white = Rgb([255, 255, 255]);
+    for face in &model.faces {
+        // 三个顶点坐标(模型空间);z 分量当前直接当深度用
         let pa = model.positions[face.v[0]];
         let pb = model.positions[face.v[1]];
         let pc = model.positions[face.v[2]];
@@ -155,13 +177,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (bx, by) = project(pb, width, height);
         let (cx, cy) = project(pc, width, height);
 
-        // 用一个简单的面下标公式区分颜色
-        let r = ((i * 37) % 255) as u8;
-        let g = ((i * 163) % 255) as u8;
-        let bl = ((i * 89) % 255) as u8;
-        let color = Rgb([r, g, bl]);
-
-        rasterize_triangle(&mut img, ax, ay, bx, by, cx, cy, color);
+        rasterize_triangle(
+            &mut img, &mut zbuf,
+            ax, ay, bx, by, cx, cy,
+            pa.z, pb.z, pc.z,
+            white,
+        );
     }
 
     img.save("output.png")?;
