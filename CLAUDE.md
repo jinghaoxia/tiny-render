@@ -14,21 +14,35 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - 无窗口/无交互，验证手段是看 `output.png`。
 - 目前没有测试；`cargo build` / `cargo check` 用于编译检查。
 
-## 代码结构
-
-当前极简，只有 `src/main.rs` 一个文件：定义 `draw_line`（Bresenham 画线），main 里在 800×800 的 `RgbImage` 上画两条线并 `save("output.png")`。依赖仅两个：`glam`（数学向量/矩阵）、`image`（像素缓冲与 PNG 编解码）。后续按里程碑扩展，会逐步长出模型解析、光栅化等模块；现状尚不宜过度设计模块划分。
-
 ## 里程碑路线与当前进度
 
 - M0 图像 + Bresenham 画线 —— 完成
-- M1 OBJ 解析 + 整网格线框 —— 当前所在
-- M2 三角形光栅化（重心坐标）
-- M3 Z-buffer + 背面剔除
-- M4 法线漫反射光照 + look-at 透视相机
+- M1 OBJ 解析 + 整网格线框 —— 完成
+- M2 三角形光栅化（重心坐标）—— 完成
+- M3 Z-buffer + 背面剔除 —— 完成
+- M4 法线漫反射光照 + look-at 透视相机 —— 完成；**Blinn-Phong 升级进行中**（着色块已改为 环境+漫反射+高光 三项结构，留了两处 `todo!()` 待用户填：半程向量 H、高光项）
 - M5 贴图（uv 插值采样 脸/头发/衣服.jpg）
 - M6 可选加分（高光/多线程/glb 对照等）
 
 推进到新里程碑后，更新本文件「当前所在」一行，并与用户的记忆目录（若存在）保持一致。
+
+## 协作约定（重要）
+
+用户明确要求：**不再逐段引导，而是每题先把整个阶段的骨架搭好、把需要用户填写的关键处用 `todo!()` 宏包起来**，用户填完后再由我检查。这覆盖了上文「混合引导」的默认节奏——本仓库现在是「脚手架 + 填空」模式，不是「用户从零写」。
+
+- 脚手架需要用户填的地方一律用 `todo!()`；`todo!()` 处若类型无法推断，需显式写类型标注（否则 E0282/E0277）。
+- 用户填完后跑 `cargo build`（或 `cargo run`）验证，再由我读代码逐条点评。
+
+## 代码结构
+
+三个文件：
+
+- `src/main.rs`：`draw_line`（Bresenham，M1 遗留、带 `#[allow(dead_code)]`）、`lookat`（视图矩阵）、`project`（透视除法 → 屏幕）、`barycentric`（重心坐标）、`rasterize_triangle`（包围盒遍历 + 深度测试 + `shade` 回调）、`main`（装配相机/光照/材质系数并遍历所有面）。
+- `src/model.rs`：`Face` / `Model` 结构、`load_obj_str`（纯内存解析，可单测）、`load_obj`（读文件），含 3 个单元测试。
+- 渲染管线关键约定：深度用**相机空间 z**，`zbuf` 初始化为 `f32::INFINITY`，判定 `z < zbuf[idx]`（相机空间 z 越小越近）。这一约定与 M3 早期写法相反，改动时勿回退。
+- `rasterize_triangle` 只负责「像素覆盖 + 深度」，颜色由 `shade(i32, i32, Vec3) -> Option<Rgb<u8>>` 闭包给出；该闭包内可访问 `ca/cb/cc`、`na/nb/nc` 等外层变量算光照。
+
+依赖仅两个：`glam`（数学向量/矩阵）、`image`（像素缓冲与 PNG 编解码）。
 
 ## resource/klee.obj 关键事实（已核实，决定解析器写法）
 
