@@ -12,19 +12,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - `cargo run` —— 编译并渲染，离屏结果写到 `output.png`（已被 .gitignore 忽略，属渲染产物）。
 - 无窗口/无交互，验证手段是看 `output.png`。
-- 目前没有测试；`cargo build` / `cargo check` 用于编译检查。
-
-## 里程碑路线与当前进度
-
-- M0 图像 + Bresenham 画线 —— 完成
-- M1 OBJ 解析 + 整网格线框 —— 完成
-- M2 三角形光栅化（重心坐标）—— 完成
-- M3 Z-buffer + 背面剔除 —— 完成
-- M4 法线漫反射光照 + look-at 透视相机 —— 完成；**Blinn-Phong 升级进行中**（着色块已改为 环境+漫反射+高光 三项结构，留了两处 `todo!()` 待用户填：半程向量 H、高光项）
-- M5 贴图（uv 插值采样 脸/头发/衣服.jpg）
-- M6 可选加分（高光/多线程/glb 对照等）
-
-推进到新里程碑后，更新本文件「当前所在」一行，并与用户的记忆目录（若存在）保持一致。
+- `cargo test` —— `src/model.rs` 有 4 个单元测试（解析器层面）。`cargo build` / `cargo check` 用于编译检查。
 
 ## 协作约定（重要）
 
@@ -32,17 +20,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - 脚手架需要用户填的地方一律用 `todo!()`；`todo!()` 处若类型无法推断，需显式写类型标注（否则 E0282/E0277）。
 - 用户填完后跑 `cargo build`（或 `cargo run`）验证，再由我读代码逐条点评。
+- 我（Claude）自己搭的脚手架也可能有 bug（M4 的深度方向就错过一次）。发现渲染异常先怀疑脚手架，别默认是用户填错。
+
+## 里程碑路线与当前进度
+
+- M0 图像 + Bresenham 画线 —— 完成
+- M1 OBJ 解析 + 整网格线框 —— 完成
+- M2 三角形光栅化（重心坐标）—— 完成
+- M3 Z-buffer + 背面剔除 —— 完成
+- M4 法线漫反射光照 + look-at 透视相机 —— 完成
+- M4+ Blinn-Phong（环境 + 漫反射 + 高光）—— 完成
+- M5 纹理映射 —— 完成（`usemtl` 材质组解析、最近邻采样、uv 重心插值、贴图 × 光照调制；12 个材质组全部挂上贴图）
+- M6 可选加分（多线程 / 背面剔除 / 抗锯齿 / glb 对照等）
+
+**当前无 `todo!()`** —— 填完全部空，渲染出带完整配色的可莉。下一步是新开 M6，按上面「协作约定」搭脚手架 + 留 `todo!()`。
+
+推进到新里程碑后，更新本文件「当前所在」一行，并与用户的记忆目录（若存在）保持一致。
 
 ## 代码结构
 
-三个文件：
-
-- `src/main.rs`：`draw_line`（Bresenham，M1 遗留、带 `#[allow(dead_code)]`）、`lookat`（视图矩阵）、`project`（透视除法 → 屏幕）、`barycentric`（重心坐标）、`rasterize_triangle`（包围盒遍历 + 深度测试 + `shade` 回调）、`main`（装配相机/光照/材质系数并遍历所有面）。
-- `src/model.rs`：`Face` / `Model` 结构、`load_obj_str`（纯内存解析，可单测）、`load_obj`（读文件），含 3 个单元测试。
+- `src/main.rs`：`draw_line`（Bresenham，M1 遗留、带 `#[allow(dead_code)]`）、`lookat`（视图矩阵）、`project`（透视除法 → 屏幕）、`barycentric`（重心坐标）、`rasterize_triangle`（包围盒遍历 + 深度测试 + `shade` 回调）、`sample`（纹理最近邻采样）、`texture_of`（材质组名 → 贴图表，见下）、`load_textures`（按表加载 3 张图并按组挂上，带缓存）、`main`（装配相机/光照/材质系数并遍历所有面）。
+- `src/model.rs`：`Face` / `Model` 结构（`Face.material` 是 `Model.materials` 的下标）、`load_obj_str`（纯内存解析，含 `usemtl` 状态跟踪）、`load_obj`（读文件），含 4 个单元测试。
 - 渲染管线关键约定：深度用**相机空间 z**，`zbuf` 初始化为 `f32::INFINITY`，判定 `z < zbuf[idx]`（相机空间 z 越小越近）。这一约定与 M3 早期写法相反，改动时勿回退。
-- `rasterize_triangle` 只负责「像素覆盖 + 深度」，颜色由 `shade(i32, i32, Vec3) -> Option<Rgb<u8>>` 闭包给出；该闭包内可访问 `ca/cb/cc`、`na/nb/nc` 等外层变量算光照。
+- `rasterize_triangle` 只负责「像素覆盖 + 深度」，颜色由 `shade(i32, i32, Vec3) -> Option<Rgb<u8>>` 闭包给出；该闭包内可访问 `ca/cb/cc`、`na/nb/nc`、`ua/ub/uc`、`textures`、`face` 等外层变量算光照与采样。
 
-依赖仅两个：`glam`（数学向量/矩阵）、`image`（像素缓冲与 PNG 编解码）。
+依赖仅两个：`glam`（数学向量/矩阵）、`image`（像素缓冲、PNG 编解码、`image::open` 读贴图）。
 
 ## resource/klee.obj 关键事实（已核实，决定解析器写法）
 
@@ -50,10 +52,25 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - `v`/`vt`/`vn` 各 15452 条；面 19099 个，**全部是三角形** `f v/vt/vn`（一行恰 3 个顶点），三者下标 1-based 且**无负索引** → 解析器无需处理扇形化或负索引换算。
 - 每行 `f i/i/i` 内三个下标编号一致，即每顶点同时带 position/uv/normal 下标。
-- 12 个 `usemtl` 材质组，组名为**中文**（脸.004、头发.004、衣服.006、眼白.004…）。
-- **`klee.mtl` 只有 Kd/Ns/d/illum，没有 `map_Kd`**：贴图文件在 `resource/贴图文件/`（脸.jpg、头发.jpg、衣服.jpg），M5 阶段需把材质组名人工映射到对应贴图；无贴图的组用平面色。资源路径含中文目录，取路径/写文件时注意。
+- 12 个 `usemtl` 材质组，组名为**中文**。按文件出现顺序为：
+  `眼白.004`、`脸.004`、`头发.004`、`耳朵.001`、`眼睛.004`、`腿.004`、`裤子.002`、`衣服.006`、`鞋子.003`、`背包`、`帽子.001`、`表情.004`。
+  `usemtl` 是状态切换：其后的 `f` 都归属该组，直到下一个 `usemtl`（`Model.materials` 按首次出现去重收集，`Face.material` 存下标）。
+- **贴图 → 材质组的对应关系任何文件里都没有**（2026-09-12 已核实并实测反推）：
+  - `klee.mtl` 只有 Kd/Ns/d/illum，**没有 `map_Kd`**。
+  - `klee.glb` 的 12 个材质也是空壳：`pbrMetallicRoughness: {}`，整个文件**连 `images`/`textures` 都没有**，`baseColorFactor` 也没留 → **glb 也恢复不出映射**，不是 obj 导出时丢的。
+  - 贴图文件在 `resource/贴图文件/`，共 3 张 2048×2048 RGB：`脸.jpg`、`头发.jpg`、`衣服.jpg`。
+- **三张 jpg 都是图集（atlas），一张覆盖多个材质组**。实测映射（`texture_of()` 里那张表）：
+  | 贴图 | 材质组 |
+  |---|---|
+  | 脸.jpg | 脸.004、眼白.004、耳朵.001、表情.004 |
+  | 头发.jpg | 头发.004、**眼睛.004** |
+  | 衣服.jpg | 衣服.006、腿.004、裤子.002、鞋子.003、背包、帽子.001 |
+  - 反推办法：把每组的 uv 包围盒分别从 3 张图裁出来看内容，再整模型渲染两版对比。决定性证据：`眼睛.004` 配 头发.jpg → 可莉标志性的红瞳；配 脸.jpg → 惨白眼球。`腿.004`/`鞋子.003` 配 衣服.jpg → 白色长筒袜 + 棕色皮靴。
+  - `表情.004`（442 面）**渲染不出任何可见像素**（单独上色后与全灰版本零差异），归属无所谓，表里挂在 脸.jpg。
+  - 资源路径含中文目录，取路径/写文件时注意。
+- **uv 方向（已实测）：`klee.obj` 的 `vt` 是自上而下，`y = v * h` 直接对应图像行号，不需要 `(1-v)` 翻转**（多数 OBJ 是 OpenGL 习惯的自下而上，需要翻）。验证办法：看外套下摆的四叶草图章是否正立。
 - 模型坐标范围约 -0.5..0.5 → 3D→屏幕映射需先缩放居中、再翻转 y（图像 y 轴向下）。
-- 另存有 `klee.glb`（约 9MB，可能内嵌贴图图集），留作 M6 对照/扩展。
+- 另存有 `klee.glb`（约 9MB，Khronos glTF Blender I/O v4.0.44 导出）。**已解析确认：它只有几何 + NORMAL + TEXCOORD_0，12 个材质全空壳，没有 images/textures/颜色** —— 不是"gz 内嵌贴图图集"，别指望从它取颜色。留作 M6 几何/结构对照。
 
 ## 其他
 

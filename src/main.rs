@@ -1,7 +1,7 @@
 mod model;
 
 use image::{Rgb, RgbImage};
-use model::load_obj;
+use model::{load_obj, Model};
 
 // 画线段。
 // 参数从 u32 改成了 i32:整幅网格投影时,顶点可能落在图像之外甚至为负
@@ -166,6 +166,88 @@ fn rasterize_triangle(
     }
 }
 
+/// 从纹理里取一个像素(最近邻采样)。
+/// (u, v) 是 obj 给的纹理坐标,范围大致 [0,1]。
+///
+/// 「纹理坐标 → 图像像素」的对应关系是 M5 的核心一步:
+/// u 沿横向走对应图像列号 x;v 沿纵向走对应行号 y —— 但 v 的朝向
+/// 两种约定都存在,是本阶段最容易搞反的地方,详见下面的 TODO。
+fn sample(tex: &RgbImage, u: f32, v: f32) -> Rgb<u8> {
+    let w = tex.width() as i32;
+    let h = tex.height() as i32;
+
+    // TODO: 把 [0,1] 的 (u,v) 换算成像素坐标 (x, y),两行:
+    //   x = u * w
+    //   y = ? * h        ← y 这一行是本阶段最大的坑
+    //
+    //   两种约定都存在,取决于导出工具:
+    //   A. vt 的 v 轴朝上(v=0 在底边、v=1 在顶边,OpenGL 习惯)→ 必须翻成
+    //      y = (1 - v) * h,因为图像行号朝下(第 0 行是顶边),两者方向相反;
+    //   B. vt 的 v 已经自上而下(v=0 就是顶边)→ 和图像行号同向,直接 y = v * h。
+    //
+    //   我已拿 klee.obj 实测过:它是 B,不翻转。
+    //   你填完自己验证一下 —— 看外套下摆那个四叶草图章:正立就对,上下颠倒就是反了。
+    //   (这也正是"贴图朝向只能靠渲染结果确认"的典型例子,光看数值看不出来。)
+    let x: f32 = u * w as f32;
+    let y: f32 = v * h as f32;
+
+    // 越界夹取:插值与浮点误差都可能让 u/v 落到 [0,1] 之外,夹住避免 panic
+    let x = (x as i32).clamp(0, w - 1) as u32;
+    let y = (y as i32).clamp(0, h - 1) as u32;
+
+    *tex.get_pixel(x, y)
+}
+
+/// 材质组名 → 用哪张贴图。
+///
+/// 这个对应关系**任何文件里都没有**:klee.mtl 没写 `map_Kd`,而 klee.glb 的 12 个
+/// 材质是空壳(没有 baseColorTexture、整个文件连 images/textures 都没有,
+/// 连 baseColorFactor 颜色都没留)。所以 glb 也恢复不出映射,只能自己推。
+///
+/// 结论:三张 jpg 都是**图集(atlas)**,一张覆盖多个材质组 ——
+///   脸.jpg   → 脸 + 五官(眼白、耳朵)
+///   头发.jpg → 头发 + 眼球(可莉的红瞳就画在这张图里)
+///   衣服.jpg → 衣服 + 袜子腿 + 裤子 + 鞋 + 背包 + 帽子
+///
+/// 这是实测反推的:把每个组的 uv 包围盒分别从 3 张图里裁出来看内容,
+/// 再整模型渲染两版对比。决定性证据是 眼睛.004 —— 配 头发.jpg 得到可莉标志性的
+/// 红色瞳孔,配 脸.jpg 则是惨白眼球;袜子/靴子配 衣服.jpg 是白色长筒袜 + 棕色皮靴,
+/// 配别的图就是杂乱色块。
+///
+/// 未知组返回 None,该面用平面色兜底。
+fn texture_of(group: &str) -> Option<&'static str> {
+    // 组名形如 "脸.004" / "背包",取 '.' 前的部分比对
+    let stem = group.split('.').next().unwrap_or(group);
+    match stem {
+        "脸" | "眼白" | "耳朵" | "表情" => Some("脸"),
+        "头发" | "眼睛" => Some("头发"),
+        "衣服" | "腿" | "裤子" | "鞋子" | "背包" | "帽子" => Some("衣服"),
+        _ => None,
+    }
+}
+
+/// 按材质组加载贴图,返回与 model.materials 等长的表(下标即 face.material)。
+/// 同一张图被多个组共用,所以先读出 3 张原图缓存,再按需挂到各组上
+/// —— 否则同一张 2048² 会被反复解码十几遍。
+fn load_textures(m: &Model) -> Result<Vec<Option<RgbImage>>, Box<dyn std::error::Error>> {
+    let mut cache: std::collections::HashMap<&'static str, RgbImage> =
+        std::collections::HashMap::new();
+    let mut out = Vec::with_capacity(m.materials.len());
+    for name in &m.materials {
+        match texture_of(name) {
+            Some(t) => {
+                if !cache.contains_key(t) {
+                    let img = image::open(format!("resource/贴图文件/{t}.jpg"))?.to_rgb8();
+                    cache.insert(t, img);
+                }
+                out.push(Some(cache[t].clone()));
+            }
+            None => out.push(None),
+        }
+    }
+    Ok(out)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let width = 800u32;
     let height = 800u32;
@@ -188,16 +270,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     const SHININESS: f32 = 32.0; // 高光锐度:越大 → 光斑越小越亮
 
     let view = lookat(eye, look_at, glam::Vec3::Y);
-    let u8_from = |v: f32| (v.clamp(0.0, 1.0) * 255.0) as u8;
 
     let model = load_obj("resource/klee.obj")?;
     eprintln!(
-        "v={} vt={} vn={} f={}",
+        "v={} vt={} vn={} f={} 材质组={:?}",
         model.positions.len(),
         model.uvs.len(),
         model.normals.len(),
-        model.faces.len()
+        model.faces.len(),
+        model.materials
     );
+
+    // 材质组名 → 贴图(没有对应贴图的组是 None)
+    let textures = load_textures(&model)?;
 
     for face in &model.faces {
         // 三组各自独立的顶点下标(position 用 v[·],法线用 vn[·])
@@ -208,6 +293,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let na = model.normals[face.vn[0]];
         let nb = model.normals[face.vn[1]];
         let nc = model.normals[face.vn[2]];
+
+        // 三个角的纹理坐标(vt 下标,和位置/法线一样三个角各一个)
+        let ua = model.uvs[face.vt[0]];
+        let ub = model.uvs[face.vt[1]];
+        let uc = model.uvs[face.vt[2]];
 
         // 世界 → 相机空间(透视除法在 project 里做)
         let ca = view.transform_point3(pa);
@@ -240,21 +330,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // TODO: 漫反射项 —— 和 Lambert 一样的点积:
                 //   diff = max(0, n·L),L 就是上面的 l
-                let diff: f32 = todo!("diff = n.dot(l).max(0.0)");
+                let diff: f32 = n.dot(l).max(0.0);
 
                 // TODO: 半程向量 H = normalize(L + V) —— Blinn-Phong 的核心。
                 //   直觉:H 是"光"与"眼睛"两个方向的角平分线方向;
                 //   表面法线 n 越贴合 H,说明"光正好经它反射进眼睛",高光越亮。
-                let h: glam::Vec3 = todo!("h = (l + v).normalize()");
+                let h: glam::Vec3 = (l + v).normalize();
 
                 // TODO: 高光项 spec = max(0, n·H)^shininess
                 //   先夹到非负,再取 SHININESS 次幂(幂越高,光斑越小越锐)。
-                let spec: f32 = todo!("spec = n.dot(h).max(0.0).powf(SHININESS)");
+                let spec: f32 =n.dot(h).max(0.0).powf(SHININESS);
 
                 // 三项相加:环境(兜底)+ 漫反射 + 高光
                 let intensity = AMBIENT + DIFFUSE_K * diff + SPEC_K * spec;
 
-                Some(Rgb([u8_from(intensity), u8_from(intensity), u8_from(intensity)]))
+                // TODO: 纹理坐标插值 —— 又是重心坐标加权平均,和法线/深度一个套路:
+                //   uv = λa·ua + λb·ub + λc·uc
+                let uv: glam::Vec3 = bc.x*ua + bc.y*ub + bc.z*uc;
+
+                // 按材质取固有色:有贴图就采样,没贴图用平面色兜底
+                let base = match textures.get(face.material).and_then(|t| t.as_ref()) {
+                    Some(tex) => sample(tex, uv.x, uv.y),
+                    None => Rgb([230, 230, 230]),
+                };
+
+                // TODO: 用 M4 的 intensity 调制固有色 ——
+                //   贴图管「是什么颜色」,光照管「有多亮」,两者相乘。
+                //   三个通道各自:base[c] as f32 * intensity,夹到 0.0..=255.0,再 as u8。
+                //   (注意是 0..=255 的实数区间,不是 0..1;所以别写成 clamp(0.0, 1.0) * 255.0。)
+                let color = Rgb([
+                    (base[0] as f32 * intensity).clamp(0.0, 255.0) as u8,
+                    (base[1] as f32 * intensity).clamp(0.0, 255.0) as u8,
+                    (base[2] as f32 * intensity).clamp(0.0, 255.0) as u8,
+                ]);
+                Some(color)
             },
         );
     }

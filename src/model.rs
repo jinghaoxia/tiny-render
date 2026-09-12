@@ -7,6 +7,8 @@ pub struct Face {
     pub v: [usize; 3],
     pub vt: [usize; 3],
     pub vn: [usize; 3],
+    /// 指向 Model::materials 的下标 —— 这个面属于哪个材质组(决定 M5 用哪张贴图)。
+    pub material: usize,
 }
 
 #[derive(Debug, Default)]
@@ -15,12 +17,19 @@ pub struct Model {
     pub uvs: Vec<Vec3>,       // vt : 纹理坐标(只用到 x,y)
     pub normals: Vec<Vec3>,   // vn : 顶点法线
     pub faces: Vec<Face>,     // f  : 三角形(每个角引用上面三个数组)
+    /// usemtl 出现过的材质组名,按首次出现顺序去重收集(如 "脸.004"、"头发.004")。
+    /// OBJ 里 usemtl 之后的所有面都归属该组,直到下一个 usemtl。
+    pub materials: Vec<String>,
 }
 
 /// 纯内存解析,不碰磁盘 —— 测试直接喂字符串,不必造临时文件。
 /// 这也是读文件版 load_obj 的内部实现。
 pub fn load_obj_str(src: &str) -> Model {
     let mut m = Model::default();
+
+    // 当前生效的材质组下标。OBJ 是"状态机"式格式:usemtl 只切换状态,
+    // 之后读到的每个 f 都归属当时生效的那个组,所以解析时要一路记着它。
+    let mut current_material: usize = 0;
 
     for line in src.lines() {
         let line = line.trim();
@@ -56,6 +65,25 @@ pub fn load_obj_str(src: &str) -> Model {
                 let z: f32 = parts.next().expect("法线缺 z").parse().expect("法线 z 不是数字");
                 m.normals.push(Vec3::new(x, y, z));
             }
+            "usemtl" => {
+                // 取本行剩下的第一个词当组名,如 "脸.004"。
+                // 存成 String(而不是 &str)是因为它要进 m.materials 长期保存,
+                // 不能借用 line —— line 下一轮循环就没了。
+                let name = parts.next().expect("usemtl 缺名字").to_string();
+
+                // 关键:同名材质在文件里会被反复切换(如 usemtl 脸.004 出现多次),
+                // 不能见一次 push 一次 —— 那样 materials 里会有重复项,
+                // 而且 Face.material 存的下标会和实际位置对不上。
+                // 所以先查这个名字有没有登记过:
+                //   iter().position(..) 返回第一个匹配元素的下标,是 Option<usize>
+                current_material = match m.materials.iter().position(|s| *s == name) {
+                    Some(i) => i, // 已登记过 → 直接复用老下标
+                    None => {
+                        m.materials.push(name); // 新组 → 追加到末尾
+                        m.materials.len() - 1   // 刚 push 的元素下标就是 len-1
+                    }
+                };
+            }
             "f" => {
                 // 每行是三个词,形如 "4/4/4" "3/3/3" "2/2/2"。
                 // 对每个词:
@@ -69,7 +97,8 @@ pub fn load_obj_str(src: &str) -> Model {
                 let mut f = Face {
                     v: [0;3],
                     vt: [0;3],
-                    vn: [0;3]
+                    vn: [0;3],
+                    material: current_material,
                 };
                 for i in 0..3 {
                     // 取一个角,例如 "4/4/4"
@@ -85,7 +114,7 @@ pub fn load_obj_str(src: &str) -> Model {
                 }
                 m.faces.push(f);
             }
-            // mtllib / usemtl / o / g / s / 3D 工具自定义头:一律忽略
+            // mtllib / o / g / s / 3D 工具自定义头:一律忽略
             _ => {}
         }
     }
@@ -143,5 +172,28 @@ f 1/1/1 1/1/1 1/1/1
         assert_eq!(m.faces[0].v, [0, 0, 0]);
         assert_eq!(m.faces[0].vt, [0, 0, 0]);
         assert_eq!(m.faces[0].vn, [0, 0, 0]);
+    }
+
+    #[test]
+    fn material_groups_are_tracked() {
+        // 两个材质组,每组一个面;第二组重复 usemtl 名一次,不应重复登记。
+        // 这个测试要等你填完 usemtl 分支才会通过。
+        let src = "\
+v 0.0 0.0 0.0
+vt 0.0 0.0
+vn 0.0 0.0 1.0
+usemtl 脸.004
+f 1/1/1 1/1/1 1/1/1
+usemtl 头发.004
+f 1/1/1 1/1/1 1/1/1
+usemtl 脸.004
+f 1/1/1 1/1/1 1/1/1
+";
+        let m = load_obj_str(src);
+        // 三个面:材质下标应是 0, 1, 0(第三个面回到第一组)
+        assert_eq!(m.materials, vec!["脸.004", "头发.004"]);
+        assert_eq!(m.faces[0].material, 0);
+        assert_eq!(m.faces[1].material, 1);
+        assert_eq!(m.faces[2].material, 0);
     }
 }
